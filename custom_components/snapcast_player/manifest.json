@@ -1,5 +1,5 @@
 {
-    "domain": "snapcast_player",
+    "domain": "snapcast_player_with_vol",
     "name": "Snapcast Player",
     "codeowners": ["@s-knibbs"],
     "dependencies": [],
