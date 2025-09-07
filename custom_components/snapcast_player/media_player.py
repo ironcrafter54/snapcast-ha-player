@@ -161,6 +161,8 @@ class SnapcastPlayer(MediaPlayerEntity):
         self.hass = hass
         self._queue: list[str] = []
         self._seek_position: float | None = None
+        self._attr_volume_level: float = 1.0
+        self._attr_is_volume_muted: bool = False
 
     async def async_play_media(self, media_type: MediaType | str, media_id: str, **kwargs: Any) -> None:
         # TODO: Support queuing items
@@ -327,7 +329,23 @@ class SnapcastPlayer(MediaPlayerEntity):
             "-ar",
             "48000",
         ]
-        delay_args = [] if self._start_delay is None else ["-af", f"adelay={self._start_delay}:all=true"]
+        
+        # Build audio filter chain
+        audio_filters = []
+        
+        # Add delay filter if configured
+        if self._start_delay is not None:
+            audio_filters.append(f"adelay={self._start_delay}:all=true")
+        
+        # Add volume filter (mute or volume level)
+        if self._attr_is_volume_muted:
+            audio_filters.append("volume=0")
+        elif self._attr_volume_level != 1.0:
+            audio_filters.append(f"volume={self._attr_volume_level}")
+        
+        # Combine filters
+        filter_args = ["-af", ",".join(audio_filters)] if audio_filters else []
+        
         if self._host.startswith("/"):
             out_arg = self._host
         else:
@@ -341,7 +359,7 @@ class SnapcastPlayer(MediaPlayerEntity):
             "-i",
             async_process_play_media_url(self.hass, uri),
             *format_args,
-            *delay_args,
+            *filter_args,
             out_arg,
         ]
         proc = await asyncio.create_subprocess_exec(*process_args, stderr=PIPE, limit=BUF_SIZE, close_fds=True)
@@ -375,6 +393,7 @@ class SnapcastPlayer(MediaPlayerEntity):
             self._attr_repeat = RepeatMode.OFF
             self._attr_state = MediaPlayerState.IDLE
             self._attr_media_image_url = None
+            # Note: Volume level and mute state are preserved across playback sessions
 
     @property
     def media_content_id(self) -> str | None:
@@ -406,6 +425,25 @@ class SnapcastPlayer(MediaPlayerEntity):
             self._is_stopped = False
             self._attr_state = MediaPlayerState.PLAYING
 
+    async def async_set_volume_level(self, volume: float) -> None:
+        """Set volume level, range 0..1."""
+        self._attr_volume_level = volume
+        self._attr_is_volume_muted = False
+        # Restart playback with new volume if currently playing
+        if self._uri and self._proc and self._proc.returncode is None:
+            current_position = self._attr_media_position
+            self._proc = await self._start_playback(self._uri, current_position)
+            self.hass.async_create_task(self._on_process_complete())
+
+    async def async_mute_volume(self, mute: bool) -> None:
+        """Mute (true) or unmute (false) media player."""
+        self._attr_is_volume_muted = mute
+        # Restart playback with new mute state if currently playing
+        if self._uri and self._proc and self._proc.returncode is None:
+            current_position = self._attr_media_position
+            self._proc = await self._start_playback(self._uri, current_position)
+            self.hass.async_create_task(self._on_process_complete())
+
     @property
     def supported_features(self) -> MediaPlayerEntityFeature:
         features = (
@@ -413,6 +451,8 @@ class SnapcastPlayer(MediaPlayerEntity):
             | MediaPlayerEntityFeature.BROWSE_MEDIA
             | MediaPlayerEntityFeature.STOP
             | MediaPlayerEntityFeature.REPEAT_SET
+            | MediaPlayerEntityFeature.VOLUME_SET
+            | MediaPlayerEntityFeature.VOLUME_MUTE
         )
         if self._proc and self._proc.returncode is None and self.media_duration:
             features |= MediaPlayerEntityFeature.PLAY
