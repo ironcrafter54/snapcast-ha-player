@@ -1,3 +1,9 @@
+"""Snapcast media player with real-time volume control.
+
+This module provides a Home Assistant media player integration for Snapcast
+that supports real-time volume control using a two-process pipeline approach.
+"""
+
 from __future__ import annotations
 import asyncio
 import os.path
@@ -84,7 +90,11 @@ class PlaylistInfo:
 
 def to_seconds(value: str) -> int:
     t = time.fromisoformat(f"{value}0000")
-    return round(delta(hours=t.hour, minutes=t.minute, seconds=t.second, microseconds=t.microsecond).total_seconds())
+    return round(
+        delta(
+            hours=t.hour, minutes=t.minute, seconds=t.second, microseconds=t.microsecond
+        ).total_seconds()
+    )
 
 
 def setup_platform(
@@ -149,7 +159,7 @@ class SnapcastPlayer(MediaPlayerEntity):
         hass: HomeAssistant,
     ) -> None:
         self._host = host
-        self._port = port
+        self._port = port or DEFAULT_PORT
         self._attr_state = MediaPlayerState.IDLE
         self._name = name
         self._start_delay = start_delay
@@ -166,13 +176,20 @@ class SnapcastPlayer(MediaPlayerEntity):
         self._volume_control_enabled: bool = False
         self._volume_proc: Process | None = None
 
-    async def async_play_media(self, media_type: MediaType | str, media_id: str, **kwargs: Any) -> None:
+    async def async_play_media(
+        self, media_type: MediaType | str, media_id: str, **kwargs: Any
+    ) -> None:
         # TODO: Support queuing items
         if media_source.is_media_source_id(media_id):
-            sourced_media = await media_source.async_resolve_media(self.hass, media_id, self.entity_id)
+            sourced_media = await media_source.async_resolve_media(
+                self.hass, media_id, self.entity_id
+            )
             media_id = sourced_media.url
 
-        if kwargs.get(ATTR_MEDIA_ANNOUNCE) and self._attr_state == MediaPlayerState.PLAYING:
+        if (
+            kwargs.get(ATTR_MEDIA_ANNOUNCE)
+            and self._attr_state == MediaPlayerState.PLAYING
+        ):
             is_live_content = self.media_duration is None
             self._proc = await self._start_playback(media_id, announcement=True)
             self.hass.async_create_task(self._on_announcement_complete(is_live_content))
@@ -188,7 +205,9 @@ class SnapcastPlayer(MediaPlayerEntity):
                 self._queue.append(item)
             self._uri = self._queue[0]
             if playlist.album_art:
-                self._attr_media_image_url = async_process_play_media_url(self.hass, playlist.album_art)
+                self._attr_media_image_url = async_process_play_media_url(
+                    self.hass, playlist.album_art
+                )
         else:
             self._uri = media_id
 
@@ -220,7 +239,9 @@ class SnapcastPlayer(MediaPlayerEntity):
         while True:
             returncode = await self._proc.wait()
             repeat_modes = [RepeatMode.ONE, RepeatMode.ALL]
-            if returncode != 0 or (self._attr_repeat not in repeat_modes and self._next_track is None):
+            if returncode != 0 or (
+                self._attr_repeat not in repeat_modes and self._next_track is None
+            ):
                 self.hass.async_create_task(self.async_update())
                 return
             if self._next_track:
@@ -296,17 +317,25 @@ class SnapcastPlayer(MediaPlayerEntity):
                 if match := title_regex.search(metadata):
                     return MediaInfo(match.group(1))
             if self._uri.startswith("/media/local"):
-                return MediaInfo(unquote(os.path.splitext(os.path.basename(self._uri))[0]))
+                return MediaInfo(
+                    unquote(os.path.splitext(os.path.basename(self._uri))[0])
+                )
         return None
 
     async def _read_ffmpeg_progress(self):
         while True:
-            if self._proc and self._proc.returncode is None and not self._proc.stderr.at_eof():
+            if (
+                self._proc
+                and self._proc.returncode is None
+                and not self._proc.stderr.at_eof()
+            ):
                 try:
                     data = await self._proc.stderr.readuntil(b"\r")
                 except IncompleteReadError:
                     return
-                if match := PROGRESS_REGEX.search(data.decode("utf-8", errors="ignore")):
+                if match := PROGRESS_REGEX.search(
+                    data.decode("utf-8", errors="ignore")
+                ):
                     position = to_seconds(match.group(1))
                     if self._seek_position:
                         position += round(self._seek_position)
@@ -316,16 +345,22 @@ class SnapcastPlayer(MediaPlayerEntity):
                 self._attr_media_position = None
                 return
 
-    async def _start_playback(self, uri: str, position: float | None = None, announcement: bool = False) -> Process:
+    async def _start_playback(
+        self, uri: str, position: float | None = None, announcement: bool = False
+    ) -> Process:
         if self._proc and self._proc.returncode is None:
             self._proc.terminate()
             self._is_stopped = False
-        if hasattr(self, '_volume_proc') and self._volume_proc and self._volume_proc.returncode is None:
+        if (
+            hasattr(self, "_volume_proc")
+            and self._volume_proc
+            and self._volume_proc.returncode is None
+        ):
             self._volume_proc.terminate()
 
         # Create a pipeline: ffmpeg -> sox (for volume control) -> output
         # This allows real-time volume adjustment without restarting the main process
-        
+
         format_args = [
             "-f",
             "s16le",  # Raw PCM format for piping to sox
@@ -336,20 +371,20 @@ class SnapcastPlayer(MediaPlayerEntity):
             "-ar",
             "48000",
         ]
-        
+
         # Build audio filter chain (without volume - sox will handle that)
         audio_filters = []
-        
+
         # Add delay filter if configured
         if self._start_delay is not None:
             audio_filters.append(f"adelay={self._start_delay}:all=true")
-        
+
         # Combine filters
         filter_args = ["-af", ",".join(audio_filters)] if audio_filters else []
-        
+
         seek_args = ["-ss", str(timedelta(seconds=round(position)))] if position else []
         self._seek_position = position
-        
+
         # First process: ffmpeg decoding to stdout
         ffmpeg_args = [
             "ffmpeg",
@@ -360,66 +395,82 @@ class SnapcastPlayer(MediaPlayerEntity):
             async_process_play_media_url(self.hass, uri),
             *format_args,
             *filter_args,
-            "-"  # Output to stdout
+            "-",  # Output to stdout
         ]
-        
+
         # Second process: sox for real-time volume control
         current_volume = 0 if self._attr_is_volume_muted else self._attr_volume_level
         if self._host.startswith("/"):
             out_arg = self._host
         else:
             out_arg = f"tcp://{self._host}:{self._port}"
-            
+            # Debug logging
+            import logging
+
+            _LOGGER = logging.getLogger(__name__)
+            _LOGGER.debug(
+                f"Snapcast player connecting to {out_arg} (host={self._host}, port={self._port})"
+            )
+
         sox_args = [
             "sox",
-            "-t", "raw",
-            "-r", "48000",
-            "-c", "2",
-            "-e", "signed-integer",
-            "-b", "16",
+            "-t",
+            "raw",
+            "-r",
+            "48000",
+            "-c",
+            "2",
+            "-e",
+            "signed-integer",
+            "-b",
+            "16",
             "-",  # Input from stdin
-            "-t", "raw",
-            "-r", "48000", 
-            "-c", "2",
-            "-e", "signed-integer",
-            "-b", "16",
+            "-t",
+            "raw",
+            "-r",
+            "48000",
+            "-c",
+            "2",
+            "-e",
+            "signed-integer",
+            "-b",
+            "16",
             out_arg,
-            "vol", str(current_volume)
+            "vol",
+            str(current_volume),
         ]
-        
+
         # Start ffmpeg process
         ffmpeg_proc = await asyncio.create_subprocess_exec(
-            *ffmpeg_args,
-            stdout=PIPE,
-            stderr=PIPE,
-            limit=BUF_SIZE,
-            close_fds=True
+            *ffmpeg_args, stdout=PIPE, stderr=PIPE, limit=BUF_SIZE, close_fds=True
         )
-        
+
         # Start sox process with ffmpeg output as input
         sox_proc = await asyncio.create_subprocess_exec(
             *sox_args,
             stdin=ffmpeg_proc.stdout,
             stderr=PIPE,
             limit=BUF_SIZE,
-            close_fds=True
+            close_fds=True,
         )
-        
+
         # Close ffmpeg stdout in parent to avoid deadlock
         if ffmpeg_proc.stdout:
             ffmpeg_proc.stdout.close()
-        
+
         # Store both processes
         self._proc = ffmpeg_proc
         self._volume_proc = sox_proc
         self._volume_control_enabled = True
         self._attr_state = MediaPlayerState.PLAYING
-        
+
         if not announcement:
-            self._attr_media_position = round(self._seek_position) if self._seek_position else 0
+            self._attr_media_position = (
+                round(self._seek_position) if self._seek_position else 0
+            )
             self._attr_media_position_updated_at = utcnow()
             self.hass.async_create_task(self._read_ffmpeg_progress())
-        
+
         return ffmpeg_proc
 
     @property
@@ -435,7 +486,11 @@ class SnapcastPlayer(MediaPlayerEntity):
 
     async def async_update(self):
         if self._proc is not None and self._proc.returncode is None:
-            self._attr_state = MediaPlayerState.PAUSED if self._is_stopped else MediaPlayerState.PLAYING
+            self._attr_state = (
+                MediaPlayerState.PAUSED
+                if self._is_stopped
+                else MediaPlayerState.PLAYING
+            )
             self._media_info = await self._get_metadata()
         else:
             self._is_stopped = False
@@ -463,7 +518,7 @@ class SnapcastPlayer(MediaPlayerEntity):
         if self._proc is not None:
             self._queue = []
             self._proc.terminate()
-        if hasattr(self, '_volume_proc') and self._volume_proc is not None:
+        if hasattr(self, "_volume_proc") and self._volume_proc is not None:
             self._volume_proc.terminate()
         self._volume_control_enabled = False
         self.hass.create_task(self.async_update())
@@ -482,40 +537,62 @@ class SnapcastPlayer(MediaPlayerEntity):
 
     async def _restart_volume_process(self) -> None:
         """Restart just the volume control process with new volume settings."""
-        if not self._volume_control_enabled or not self._proc or self._proc.returncode is not None:
+        if (
+            not self._volume_control_enabled
+            or not self._proc
+            or self._proc.returncode is not None
+        ):
             return
-            
+
         # Terminate existing sox process
         if self._volume_proc and self._volume_proc.returncode is None:
             self._volume_proc.terminate()
-            
+
         # Calculate current volume
         current_volume = 0 if self._attr_is_volume_muted else self._attr_volume_level
-        
+
         # Determine output destination
         if self._host.startswith("/"):
             out_arg = self._host
         else:
             out_arg = f"tcp://{self._host}:{self._port}"
-            
+            # Debug logging
+            import logging
+
+            _LOGGER = logging.getLogger(__name__)
+            _LOGGER.debug(
+                f"Snapcast volume process connecting to {out_arg} (host={self._host}, port={self._port})"
+            )
+
         # Start new sox process with updated volume
         sox_args = [
             "sox",
-            "-t", "raw",
-            "-r", "48000",
-            "-c", "2", 
-            "-e", "signed-integer",
-            "-b", "16",
+            "-t",
+            "raw",
+            "-r",
+            "48000",
+            "-c",
+            "2",
+            "-e",
+            "signed-integer",
+            "-b",
+            "16",
             "-",  # Input from stdin (ffmpeg stdout)
-            "-t", "raw",
-            "-r", "48000",
-            "-c", "2",
-            "-e", "signed-integer", 
-            "-b", "16",
+            "-t",
+            "raw",
+            "-r",
+            "48000",
+            "-c",
+            "2",
+            "-e",
+            "signed-integer",
+            "-b",
+            "16",
             out_arg,
-            "vol", str(current_volume)
+            "vol",
+            str(current_volume),
         ]
-        
+
         try:
             # Create new sox process connected to existing ffmpeg
             self._volume_proc = await asyncio.create_subprocess_exec(
@@ -523,7 +600,7 @@ class SnapcastPlayer(MediaPlayerEntity):
                 stdin=self._proc.stdout,
                 stderr=PIPE,
                 limit=BUF_SIZE,
-                close_fds=True
+                close_fds=True,
             )
         except Exception:
             # If sox restart fails, fall back to restarting entire pipeline
@@ -536,7 +613,7 @@ class SnapcastPlayer(MediaPlayerEntity):
         """Set volume level, range 0..1."""
         self._attr_volume_level = volume
         self._attr_is_volume_muted = False
-        
+
         # Restart volume process with new volume
         if self._volume_control_enabled:
             await self._restart_volume_process()
@@ -544,7 +621,7 @@ class SnapcastPlayer(MediaPlayerEntity):
     async def async_mute_volume(self, mute: bool) -> None:
         """Mute (true) or unmute (false) media player."""
         self._attr_is_volume_muted = mute
-        
+
         # Restart volume process with new mute state
         if self._volume_control_enabled:
             await self._restart_volume_process()
@@ -569,7 +646,9 @@ class SnapcastPlayer(MediaPlayerEntity):
             features |= MediaPlayerEntityFeature.PREVIOUS_TRACK
         return features
 
-    async def async_browse_media(self, media_content_type: str | None = None, media_content_id: str | None = None):
+    async def async_browse_media(
+        self, media_content_type: str | None = None, media_content_id: str | None = None
+    ):
         return await media_source.async_browse_media(
             self.hass,
             media_content_id,

@@ -1,4 +1,4 @@
-DOMAIN = "snapcast_player_with_vol"
+DOMAIN = "snapcast_player"
 DEFAULT_PORT = "4953"
 CONF_HOST = "host"
 CONF_PORT = "port"
