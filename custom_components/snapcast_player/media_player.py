@@ -163,6 +163,8 @@ class SnapcastPlayer(MediaPlayerEntity):
         self._seek_position: float | None = None
         self._attr_volume_level: float = 1.0
         self._attr_is_volume_muted: bool = False
+        self._volume_control_enabled: bool = False
+        self._volume_proc: Process | None = None
 
     async def async_play_media(self, media_type: MediaType | str, media_id: str, **kwargs: Any) -> None:
         # TODO: Support queuing items
@@ -318,10 +320,15 @@ class SnapcastPlayer(MediaPlayerEntity):
         if self._proc and self._proc.returncode is None:
             self._proc.terminate()
             self._is_stopped = False
+        if hasattr(self, '_volume_proc') and self._volume_proc and self._volume_proc.returncode is None:
+            self._volume_proc.terminate()
 
+        # Create a pipeline: ffmpeg -> sox (for volume control) -> output
+        # This allows real-time volume adjustment without restarting the main process
+        
         format_args = [
             "-f",
-            "u16le",
+            "s16le",  # Raw PCM format for piping to sox
             "-acodec",
             "pcm_s16le",
             "-ac",
@@ -330,45 +337,90 @@ class SnapcastPlayer(MediaPlayerEntity):
             "48000",
         ]
         
-        # Build audio filter chain
+        # Build audio filter chain (without volume - sox will handle that)
         audio_filters = []
         
         # Add delay filter if configured
         if self._start_delay is not None:
             audio_filters.append(f"adelay={self._start_delay}:all=true")
         
-        # Add volume filter (mute or volume level)
-        if self._attr_is_volume_muted:
-            audio_filters.append("volume=0")
-        elif self._attr_volume_level != 1.0:
-            audio_filters.append(f"volume={self._attr_volume_level}")
-        
         # Combine filters
         filter_args = ["-af", ",".join(audio_filters)] if audio_filters else []
         
-        if self._host.startswith("/"):
-            out_arg = self._host
-        else:
-            out_arg = f"tcp://{self._host}:{self._port}"
         seek_args = ["-ss", str(timedelta(seconds=round(position)))] if position else []
         self._seek_position = position
-        process_args = [
+        
+        # First process: ffmpeg decoding to stdout
+        ffmpeg_args = [
             "ffmpeg",
             "-y",
+            "-nostdin",
             *seek_args,
             "-i",
             async_process_play_media_url(self.hass, uri),
             *format_args,
             *filter_args,
-            out_arg,
+            "-"  # Output to stdout
         ]
-        proc = await asyncio.create_subprocess_exec(*process_args, stderr=PIPE, limit=BUF_SIZE, close_fds=True)
+        
+        # Second process: sox for real-time volume control
+        current_volume = 0 if self._attr_is_volume_muted else self._attr_volume_level
+        if self._host.startswith("/"):
+            out_arg = self._host
+        else:
+            out_arg = f"tcp://{self._host}:{self._port}"
+            
+        sox_args = [
+            "sox",
+            "-t", "raw",
+            "-r", "48000",
+            "-c", "2",
+            "-e", "signed-integer",
+            "-b", "16",
+            "-",  # Input from stdin
+            "-t", "raw",
+            "-r", "48000", 
+            "-c", "2",
+            "-e", "signed-integer",
+            "-b", "16",
+            out_arg,
+            "vol", str(current_volume)
+        ]
+        
+        # Start ffmpeg process
+        ffmpeg_proc = await asyncio.create_subprocess_exec(
+            *ffmpeg_args,
+            stdout=PIPE,
+            stderr=PIPE,
+            limit=BUF_SIZE,
+            close_fds=True
+        )
+        
+        # Start sox process with ffmpeg output as input
+        sox_proc = await asyncio.create_subprocess_exec(
+            *sox_args,
+            stdin=ffmpeg_proc.stdout,
+            stderr=PIPE,
+            limit=BUF_SIZE,
+            close_fds=True
+        )
+        
+        # Close ffmpeg stdout in parent to avoid deadlock
+        if ffmpeg_proc.stdout:
+            ffmpeg_proc.stdout.close()
+        
+        # Store both processes
+        self._proc = ffmpeg_proc
+        self._volume_proc = sox_proc
+        self._volume_control_enabled = True
         self._attr_state = MediaPlayerState.PLAYING
+        
         if not announcement:
             self._attr_media_position = round(self._seek_position) if self._seek_position else 0
             self._attr_media_position_updated_at = utcnow()
             self.hass.async_create_task(self._read_ffmpeg_progress())
-        return proc
+        
+        return ffmpeg_proc
 
     @property
     def media_artist(self) -> str | None:
@@ -411,7 +463,10 @@ class SnapcastPlayer(MediaPlayerEntity):
         if self._proc is not None:
             self._queue = []
             self._proc.terminate()
-            self.hass.create_task(self.async_update())
+        if hasattr(self, '_volume_proc') and self._volume_proc is not None:
+            self._volume_proc.terminate()
+        self._volume_control_enabled = False
+        self.hass.create_task(self.async_update())
 
     def media_pause(self) -> None:
         if self._proc is not None and self._proc.returncode is None:
@@ -425,24 +480,74 @@ class SnapcastPlayer(MediaPlayerEntity):
             self._is_stopped = False
             self._attr_state = MediaPlayerState.PLAYING
 
+    async def _restart_volume_process(self) -> None:
+        """Restart just the volume control process with new volume settings."""
+        if not self._volume_control_enabled or not self._proc or self._proc.returncode is not None:
+            return
+            
+        # Terminate existing sox process
+        if self._volume_proc and self._volume_proc.returncode is None:
+            self._volume_proc.terminate()
+            
+        # Calculate current volume
+        current_volume = 0 if self._attr_is_volume_muted else self._attr_volume_level
+        
+        # Determine output destination
+        if self._host.startswith("/"):
+            out_arg = self._host
+        else:
+            out_arg = f"tcp://{self._host}:{self._port}"
+            
+        # Start new sox process with updated volume
+        sox_args = [
+            "sox",
+            "-t", "raw",
+            "-r", "48000",
+            "-c", "2", 
+            "-e", "signed-integer",
+            "-b", "16",
+            "-",  # Input from stdin (ffmpeg stdout)
+            "-t", "raw",
+            "-r", "48000",
+            "-c", "2",
+            "-e", "signed-integer", 
+            "-b", "16",
+            out_arg,
+            "vol", str(current_volume)
+        ]
+        
+        try:
+            # Create new sox process connected to existing ffmpeg
+            self._volume_proc = await asyncio.create_subprocess_exec(
+                *sox_args,
+                stdin=self._proc.stdout,
+                stderr=PIPE,
+                limit=BUF_SIZE,
+                close_fds=True
+            )
+        except Exception:
+            # If sox restart fails, fall back to restarting entire pipeline
+            if self._uri:
+                current_position = self._attr_media_position
+                self._proc = await self._start_playback(self._uri, current_position)
+                self.hass.async_create_task(self._on_process_complete())
+
     async def async_set_volume_level(self, volume: float) -> None:
         """Set volume level, range 0..1."""
         self._attr_volume_level = volume
         self._attr_is_volume_muted = False
-        # Restart playback with new volume if currently playing
-        if self._uri and self._proc and self._proc.returncode is None:
-            current_position = self._attr_media_position
-            self._proc = await self._start_playback(self._uri, current_position)
-            self.hass.async_create_task(self._on_process_complete())
+        
+        # Restart volume process with new volume
+        if self._volume_control_enabled:
+            await self._restart_volume_process()
 
     async def async_mute_volume(self, mute: bool) -> None:
         """Mute (true) or unmute (false) media player."""
         self._attr_is_volume_muted = mute
-        # Restart playback with new mute state if currently playing
-        if self._uri and self._proc and self._proc.returncode is None:
-            current_position = self._attr_media_position
-            self._proc = await self._start_playback(self._uri, current_position)
-            self.hass.async_create_task(self._on_process_complete())
+        
+        # Restart volume process with new mute state
+        if self._volume_control_enabled:
+            await self._restart_volume_process()
 
     @property
     def supported_features(self) -> MediaPlayerEntityFeature:
