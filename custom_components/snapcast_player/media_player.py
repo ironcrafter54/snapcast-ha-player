@@ -367,6 +367,10 @@ class SnapcastPlayer(MediaPlayerEntity):
             "2",
             "-ar",
             "48000",
+            "-flush_packets",
+            "1",  # Reduce latency
+            "-fflags",
+            "+genpts",  # Generate presentation timestamps
         ]
 
         # Build audio filter chain with volume control
@@ -398,15 +402,35 @@ class SnapcastPlayer(MediaPlayerEntity):
 
         seek_args = ["-ss", str(timedelta(seconds=round(position)))] if position else []
         self._seek_position = position
+        # Add network optimizations for TCP output
+        network_args = []
+        if not self._host.startswith("/"):  # TCP connection
+            network_args = [
+                "-tcp_nodelay",
+                "1",  # Disable Nagle's algorithm
+                "-flush_packets",
+                "1",  # Flush packets immediately
+            ]
+
         process_args = [
             "ffmpeg",
             "-y",
             "-nostdin",
+            "-re",  # Read input at native frame rate
+            "-probesize",
+            "32",  # Reduce probe size for faster startup
+            "-analyzeduration",
+            "0",  # Reduce analysis time
             *seek_args,
             "-i",
             async_process_play_media_url(self.hass, uri),
+            "-buffer_size",
+            "64k",  # Set buffer size
+            "-max_delay",
+            "500000",  # Max delay in microseconds
             *format_args,
             *filter_args,
+            *network_args,
             out_arg,
         ]
         proc = await asyncio.create_subprocess_exec(
